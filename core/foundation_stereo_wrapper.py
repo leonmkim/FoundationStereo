@@ -5,6 +5,8 @@ import sys
 root_foundation_stereo_path = Path(__file__).parent.parent.parent
 assert root_foundation_stereo_path.exists(), f"FoundationStereo path does not exist: {root_foundation_stereo_path}"
 sys.path.append(str(root_foundation_stereo_path))
+import torchvision
+import einops
 #%%
 from FoundationStereo.core.utils.utils import InputPadder
 from FoundationStereo.Utils import *
@@ -63,34 +65,46 @@ class FoundationStereoWrapper:
         self.model.eval()
 
 
-    def infer(self, img0, img1):
+    def inference(self, img0, img1):
         # Inference code here
-        img0 = cv2.resize(img0, fx=self.args.scale, fy=self.args.scale, dsize=None)
-        img1 = cv2.resize(img1, fx=self.args.scale, fy=self.args.scale, dsize=None)
-        H,W = img0.shape[:2]
-        img0_ori = img0.copy()
-        logging.info(f"img0: {img0.shape}")
+        assert img0.shape == img1.shape, "Left and right images must have the same shape"
 
-        img0 = torch.as_tensor(img0).cuda().float()[None].permute(0,3,1,2)
-        img1 = torch.as_tensor(img1).cuda().float()[None].permute(0,3,1,2)
+        if isinstance(img0, np.ndarray):
+            assert img0.ndim == 3, "img0 must be HWC numpy array"
+            assert img0.shape[2] == 3, "img0 must have 3 channels"
+            # put numpy array to torch tensor on GPU
+            img0 = einops.rearrange(torch.as_tensor(img0).cuda().float(), 'h w c -> () c h w')
+        if isinstance(img1, np.ndarray):
+            img1 = einops.rearrange(torch.as_tensor(img1).cuda().float(), 'h w c -> () c h w')
+
+        if self.args.scale != 1.0:
+            img0 = torchvision.transforms.v2.functional.resize(img0, size=None, scale_factor=self.args.scale, interpolation=torchvision.transforms.InterpolationMode.LANCZOS, antialias=True)
+            img1 = torchvision.transforms.v2.functional.resize(img1, size=None, scale_factor=self.args.scale, interpolation=torchvision.transforms.InterpolationMode.LANCZOS, antialias=True)
+
         padder = InputPadder(img0.shape, divis_by=32, force_square=False)
         img0, img1 = padder.pad(img0, img1)
 
-        with torch.cuda.amp.autocast(True):
+        with torch.amp.autocast(enabled=True, dtype=torch.bfloat16, device_type='cuda'):
             if not self.args.hiera:
                 disp = self.model.forward(img0, img1, iters=self.args.valid_iters, test_mode=True)
             else:
                 disp = self.model.run_hierachical(img0, img1, iters=self.args.valid_iters, test_mode=True, small_ratio=0.5)
         disp = padder.unpad(disp.float())
-        disp = disp.data.cpu().numpy().reshape(H,W)
-        vis = vis_disparity(disp)
-        vis = np.concatenate([img0_ori, vis], axis=1)
+        # disp = disp.data.cpu().numpy().reshape(H,W)
 
         if self.args.remove_invisible:
-            yy,xx = np.meshgrid(np.arange(disp.shape[0]), np.arange(disp.shape[1]), indexing='ij')
-            us_right = xx-disp
-            invalid = us_right<0
-            disp[invalid] = np.inf
+            yy,xx = torch.meshgrid(torch.arange(disp.shape[-2], device=disp.device), torch.arange(disp.shape[-1], device=disp.device), indexing='ij')
+            us_right = xx - disp
+            invalid = us_right < 0
+            disp[invalid] = float('inf')
+            # yy,xx = np.meshgrid(np.arange(disp.shape[0]), np.arange(disp.shape[1]), indexing='ij')
+            # us_right = xx-disp
+            # invalid = us_right<0
+            # disp[invalid] = np.inf
         
         left_depth_image = (self.camera_intrinsic_left[0,0]*self.baseline/disp)/1000.0  # in meters
+
         return left_depth_image
+
+    def batch_inference(self, batch_img0, batch_img1):
+        raise NotImplementedError("Batch inference is not implemented yet.")
