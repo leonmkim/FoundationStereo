@@ -74,7 +74,32 @@ def depth2xyzmap(depth:np.ndarray, K, uvs:np.ndarray=None, zmin=0.1):
     xyz_map[invalid_mask] = 0
   return xyz_map
 
-
+def batched_depth2xyzmap(depth:torch.Tensor, K:torch.Tensor, uvs:torch.Tensor=None, zmin=0.1):
+  """
+  @depth: BxHxW
+  @K: Bx3x3
+  @uvs: Nx2 or None
+  """
+  B,H,W = depth.shape
+  device = depth.device
+  if uvs is None:
+    vs,us = torch.meshgrid(torch.arange(0,H, device=device),torch.arange(0,W, device=device), indexing='ij')
+    vs = vs.reshape(-1)
+    us = us.reshape(-1)
+  else:
+    uvs = uvs.round().long()
+    us = uvs[:,0]
+    vs = uvs[:,1]
+  zs = depth[:,vs,us]  # BxN
+  xs = (us[None,:]-K[:,0,2:3])*zs/K[:,0,0:1]  # BxN
+  ys = (vs[None,:]-K[:,1,2:3])*zs/K[:,1,1:2]  # BxN
+  pts = torch.stack((xs.reshape(B,-1),ys.reshape(B,-1),zs.reshape(B,-1)), 2)  #(B,N,3)
+  xyz_map = torch.zeros((B,H,W,3), dtype=torch.float32, device=device)
+  xyz_map[:,vs,us,:] = pts
+  invalid_mask = (depth<zmin)
+  if invalid_mask.any():
+    xyz_map[invalid_mask] = 0
+  return xyz_map
 
 def freeze_model(model):
   model = model.eval()
