@@ -23,17 +23,18 @@ class FoundationStereoWrapper:
         self.ckpt_path = ckpt_path
         if isinstance(camera_intrinsic_left, np.ndarray):
             assert isinstance(baseline, float), "If camera_intrinsic_left is numpy array, baseline must be float"
+            assert camera_intrinsic_left.ndim == 2 and camera_intrinsic_left.shape == (3,3), "camera_intrinsic_left must be 3x3 numpy array"
             self.batch_inference_mode = False
         elif isinstance(camera_intrinsic_left, torch.Tensor):
             assert isinstance(baseline, torch.Tensor), "If camera_intrinsic_left is torch tensor, baseline must be torch tensor"
             self.batch_inference_mode = True
-            camera_intrinsic_left = camera_intrinsic_left.cuda()
-            baseline = baseline.cuda()
+            camera_intrinsic_left = camera_intrinsic_left.cuda().float()
+            baseline = baseline.cuda().float()
         else:
             raise TypeError("camera_intrinsic_left must be either numpy array or torch tensor")
         
-        self.camera_intrinsic_left = camera_intrinsic_left.float()
-        self.baseline = baseline.float()
+        self.camera_intrinsic_left = camera_intrinsic_left
+        self.baseline = baseline
 
         assert ckpt_path.exists(), f"Checkpoint does not exist: {ckpt_path}"
         assert scale<=1.0, "scale must be <=1.0"
@@ -121,6 +122,7 @@ class FoundationStereoWrapper:
         
         if not self.batch_inference_mode:
             left_depth_image = (self.camera_intrinsic_left[0,0]*self.baseline/disp)/1000.0  # in meters
+            left_depth_image = left_depth_image[0,0].cpu().numpy()
         else:
             # camera_intrinsic_left: Bx3x3, baseline: B tensors
             # disp: Bx1xHxW
