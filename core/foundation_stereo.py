@@ -27,6 +27,11 @@ from core.utils.utils import InputPadder
 # from Utils import *
 import time,huggingface_hub
 
+from belt_perception.foundation_stereo_wrapper.confidence_utils import (
+    convergence_from_deltas,
+    disparity_aligned_confidence,
+)
+
 
 try:
     autocast = torch.cuda.amp.autocast
@@ -186,18 +191,34 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         self.dx = dx
 
 
-    def upsample_disp(self, disp, mask_feat_4, stem_2x):
+    def upsample_with_spx(self, x, mask_feat_4, stem_2x, scale_disparity: bool):
+        """Upsample a 1/4-res map to full-res using the frozen SPX path.
 
+        When *scale_disparity* is True the input is multiplied by 4 (disparity
+        convention).  When False the raw values pass through unchanged (used for
+        confidence maps in [0, 1]).
+        """
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
         with autocast(enabled=self.args.mixed_precision):
-            xspx = self.spx_2_gru(mask_feat_4, stem_2x)   # 1/2 resolution
+            xspx = self.spx_2_gru(mask_feat_4, stem_2x)
             spx_pred = self.spx_gru(xspx)
             spx_pred = F.softmax(spx_pred, 1)
-            up_disp = context_upsample(disp*4., spx_pred).unsqueeze(1)
+            if scale_disparity:
+                up_x = context_upsample(x * 4., spx_pred).unsqueeze(1)
+            else:
+                up_x = context_upsample(x, spx_pred).unsqueeze(1)
+        return up_x.float(), spx_pred
 
-        return up_disp.float()
+    def upsample_disp(self, disp, mask_feat_4, stem_2x):
+        return self.upsample_with_spx(disp, mask_feat_4, stem_2x, scale_disparity=True)[0]
 
 
-    def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False, low_memory=False, init_disp=None):
+    def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False,
+                low_memory=False, init_disp=None,
+                return_confidence_aux=False, confidence_mode="none",
+                confidence_last_k=3, confidence_conv_beta=2.0,
+                confidence_cost_sigma=1.5, confidence_cost_radius=3.0):
         """ Estimate disparity between pair of frames """
         B = len(image1)
         low_memory = low_memory or (self.args.get('low_memory', False))
@@ -221,7 +242,8 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             comb_volume = self.cost_agg(comb_volume, features_left)
 
             # Init disp from geometry encoding volume
-            prob = F.softmax(self.classifier(comb_volume).squeeze(1), dim=1)  #(B, max_disp, H, W)
+            logits = self.classifier(comb_volume).squeeze(1)
+            prob = F.softmax(logits, dim=1)  #(B, max_disp, H, W)
             if init_disp is None:
               init_disp = disparity_regression(prob, self.args.max_disp//4)  # Weighted  sum of disparity
 
@@ -238,6 +260,9 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         disp = init_disp.float()
         disp_preds = []
 
+        need_convergence = return_confidence_aux and confidence_mode in ("convergence", "hybrid")
+        delta_abs_list: list[torch.Tensor] = []
+
         # GRUs iterations to update disparity (1/4 resolution)
         for itr in range(iters):
             disp = disp.detach()
@@ -246,6 +271,12 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
               net_list, mask_feat_4, delta_disp = self.update_block(net_list, inp_list, geo_feat, disp, att)
 
             disp = disp + delta_disp.float()
+
+            if need_convergence:
+                delta_abs_list.append(delta_disp.detach().abs().float())
+                if len(delta_abs_list) > confidence_last_k:
+                    delta_abs_list.pop(0)
+
             if test_mode and itr < iters-1:
                 continue
 
@@ -253,14 +284,47 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
             disp_up = self.upsample_disp(disp.float(), mask_feat_4.float(), stem_2x.float())
             disp_preds.append(disp_up)
 
-
         if test_mode:
-            return disp_up
+            if not return_confidence_aux:
+                return disp_up
+
+            aux: dict[str, torch.Tensor] = {}
+            if need_convergence and delta_abs_list:
+                conf_conv_1_4 = convergence_from_deltas(
+                    delta_abs_list, confidence_conv_beta,
+                )
+                if conf_conv_1_4.ndim == 3:
+                    conf_conv_1_4 = conf_conv_1_4.unsqueeze(1)
+                conf_conv_up, _ = self.upsample_with_spx(
+                    conf_conv_1_4.squeeze(1).float(), mask_feat_4.float(), stem_2x.float(),
+                    scale_disparity=False,
+                )
+                aux["confidence_convergence"] = conf_conv_up
+
+            need_cost = return_confidence_aux and confidence_mode == "cost_volume_support"
+            if need_cost:
+                conf_cv_1_4 = disparity_aligned_confidence(
+                    prob.float(), disp.float(),
+                    confidence_cost_sigma, confidence_cost_radius,
+                )
+                if conf_cv_1_4.ndim == 3:
+                    conf_cv_1_4 = conf_cv_1_4.unsqueeze(1)
+                conf_cv_up, _ = self.upsample_with_spx(
+                    conf_cv_1_4.squeeze(1).float(), mask_feat_4.float(), stem_2x.float(),
+                    scale_disparity=False,
+                )
+                aux["confidence_cost_volume_support"] = conf_cv_up
+
+            return disp_up, aux
 
         return init_disp, disp_preds
 
 
-    def run_hierachical(self, image1, image2, iters=12, test_mode=False, low_memory=False, small_ratio=0.5):
+    def run_hierachical(self, image1, image2, iters=12, test_mode=False,
+                        low_memory=False, small_ratio=0.5,
+                        return_confidence_aux=False, confidence_mode="none",
+                        confidence_last_k=3, confidence_conv_beta=2.0,
+                        confidence_cost_sigma=1.5, confidence_cost_radius=3.0):
       B,_,H,W = image1.shape
       img1_small = F.interpolate(image1, scale_factor=small_ratio, align_corners=False, mode='bilinear')
       img2_small = F.interpolate(image2, scale_factor=small_ratio, align_corners=False, mode='bilinear')
@@ -275,7 +339,25 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       image1, image2, disp_small_up = padder.pad(image1, image2, disp_small_up)
       disp_small_up += padder._pad[0]
       init_disp = F.interpolate(disp_small_up, scale_factor=0.25, mode='bilinear', align_corners=True) * 0.25   # Init disp will be 1/4
-      disp = self.forward(image1, image2, iters=iters, test_mode=test_mode, low_memory=low_memory, init_disp=init_disp)
-      disp = padder.unpad(disp.float())
-      return disp
+      result = self.forward(
+          image1, image2, iters=iters, test_mode=test_mode,
+          low_memory=low_memory, init_disp=init_disp,
+          return_confidence_aux=return_confidence_aux,
+          confidence_mode=confidence_mode,
+          confidence_last_k=confidence_last_k,
+          confidence_conv_beta=confidence_conv_beta,
+          confidence_cost_sigma=confidence_cost_sigma,
+          confidence_cost_radius=confidence_cost_radius,
+      )
+
+      if return_confidence_aux and test_mode and isinstance(result, tuple):
+          disp, aux = result
+          disp = padder.unpad(disp.float())
+          for k, v in aux.items():
+              aux[k] = padder.unpad(v.float())
+          return disp, aux
+
+      if isinstance(result, tuple):
+          return result
+      return padder.unpad(result.float())
 
