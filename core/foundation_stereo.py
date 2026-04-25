@@ -34,15 +34,19 @@ from belt_perception.foundation_stereo_wrapper.confidence_utils import (
 
 
 try:
-    autocast = torch.cuda.amp.autocast
-except:
-    class autocast:
-        def __init__(self, enabled):
-            pass
-        def __enter__(self):
-            pass
-        def __exit__(self, *args):
-            pass
+    def autocast(enabled: bool = True):
+        return torch.amp.autocast("cuda", enabled=enabled)
+except Exception:
+    try:
+        autocast = torch.cuda.amp.autocast
+    except Exception:
+        class autocast:
+            def __init__(self, enabled):
+                pass
+            def __enter__(self):
+                pass
+            def __exit__(self, *args):
+                pass
 
 
 def normalize_image(img):
